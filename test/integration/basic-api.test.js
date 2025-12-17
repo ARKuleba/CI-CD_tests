@@ -9,7 +9,7 @@ app.get("/api/test/all", (req, res) => {
 
 describe("Basic API Tests", () => {
   test("GET /api/test/all should return test message", async () => {
-    const response = await request(app).get("/api/test/all").expect(2032432340);
+    const response = await request(app).get("/api/test/all").expect(200);
 
     expect(response.text).toBe("Test info lab4.");
   });
