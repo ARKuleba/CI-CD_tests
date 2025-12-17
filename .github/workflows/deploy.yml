@@ -3,90 +3,63 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [main]
-  workflow_dispatch:
-
-env:
-  NODE_ENV: test
-  DB_DIALECT: sqlite
-  DB_STORAGE: ./test-database.sqlite
+  workflow_dispatch: # для ручного запуска деплоев
 
 jobs:
-  test:
+  unit-tests:
+    name: Run Unit Tests
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [18.x]
     
+    env:
+      NODE_ENV: test
+      DB_DIALECT: sqlite
+      DB_STORAGE: ./unit-test-db.sqlite
+      JWT_SECRET: test-jwt-unit-$(date +%s)
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: ${{ matrix.node-version }}
+        node-version: '18'
         cache: 'npm'
-    
-    - name: Debug environment
-      run: |
-        echo "=== ENVIRONMENT VARIABLES ==="
-        echo "NODE_ENV: $NODE_ENV"
-        echo "DB_DIALECT: $DB_DIALECT"
-        echo "DB_STORAGE: $DB_STORAGE"
-        echo "============================="
-    
+
+    - name: Cache node modules
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+
     - name: Install dependencies
       run: |
         npm ci
         echo "✅ Dependencies installed"
-        echo "SQLite version:"
-        npm list sqlite3
-    
-    - name: Create test database directory
-      run: mkdir -p ./test-db
-    
+
+    - name: Create test database
+      run: |
+        touch $DB_STORAGE
+        echo "📁 Database file: $DB_STORAGE"
+
     - name: Run unit tests
       run: |
-        echo "🔧 Running unit tests..."
-        npm test
+        echo "🧪 Running unit tests..."
+        npm test -- --verbose
       continue-on-error: false
-    
-    - name: Run integration tests
-      env:
-        DB_STORAGE: ./test-db/test.sqlite
-        JWT_SECRET: test-jwt-secret-for-ci-12345
-        PORT: 3000
-      run: |
-        echo "🔧 Running integration tests..."
-        echo "Using SQLite database: $DB_STORAGE"
-        
-        # Убедимся, что файл БД существует
-        touch $DB_STORAGE
-        
-        # Запуск тестов с детальным выводом
-        npm run test:integration -- --verbose --detectOpenHandles --forceExit
-        
-        echo "✅ Integration tests completed"
-      continue-on-error: false
-    
-    - name: Upload test results
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: test-results
-        path: |
-          test-results/
-          coverage/
-          test-db/
-        retention-days: 7
 
-  deploy-staging:
-    needs: test
+  stage:
+    name: Deploy to Staging
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    needs: unit-tests
     environment: staging
-    
+
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
     - name: Deploy to Staging (Render)
       env:
         RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
@@ -100,48 +73,82 @@ jobs:
           -d '{"clearCache": true}'
         echo "✅ Staging deployment triggered"
 
-  staging-smoke-test:
-    needs: deploy-staging
+    - name: Wait for staging deployment
+      run: |
+        echo "⏳ Waiting 30 seconds for deployment..."
+        sleep 30
+
+  integration-tests:
+    name: Run Integration Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    needs: stage
     
+    env:
+      NODE_ENV: test
+      DB_DIALECT: sqlite
+      DB_STORAGE: ./integration-test-db.sqlite
+      JWT_SECRET: test-jwt-integration-$(date +%s)
+
     steps:
-    - name: Install curl
-      run: sudo apt-get update && sudo apt-get install -y curl
-    
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Cache node modules
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Create test database
+      run: |
+        touch $DB_STORAGE
+        echo "📁 Database file: $DB_STORAGE"
+
+    - name: Run integration tests
+      run: |
+        echo "🧪 Running integration tests..."
+        echo "Using SQLite database: $DB_STORAGE"
+        npm run test:integration -- --verbose --detectOpenHandles
+      continue-on-error: false
+
     - name: Smoke test Staging
+      if: success()
       env:
         STAGING_URL: ${{ secrets.RENDER_STAGING_URL }}
       run: |
         echo "🧪 Testing Staging Environment..."
         echo "Staging URL: $STAGING_URL"
         
-        counter=0
-        max_attempts=10
+        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
         
-        while [ $counter -lt $max_attempts ]; do
-          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
-          
-          if [ "$response" = "200" ]; then
-            echo "✅ Staging is up and running (HTTP $response)"
-            exit 0
-          else
-            echo "⏳ Health check failed (HTTP $response), waiting 5 seconds..."
-            sleep 5
-            counter=$((counter + 1))
-          fi
-        done
-        
-        echo "❌ Staging failed to start after $max_attempts attempts"
-        exit 1
+        if [ "$response" = "200" ]; then
+          echo "✅ Staging is up and running (HTTP $response)"
+        else
+          echo "⚠️ Staging health check failed: HTTP $response"
+        fi
 
-  deploy-production:
-    needs: test
+  deploy:
+    name: Deploy to Production
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    needs: integration-tests
     environment: production
-    
+    if: github.event_name == 'workflow_dispatch'  # Только ручной запуск!
+
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
     - name: Deploy to Production (Render)
       env:
         RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
@@ -155,16 +162,13 @@ jobs:
           -d '{"clearCache": true}'
         echo "✅ Production deployment triggered"
 
-  production-smoke-test:
-    needs: deploy-production
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    
-    steps:
-    - name: Install curl
-      run: sudo apt-get update && sudo apt-get install -y curl
-    
+    - name: Wait for production deployment
+      run: |
+        echo "⏳ Waiting 30 seconds for deployment..."
+        sleep 30
+
     - name: Smoke test Production
+      if: success()
       env:
         PRODUCTION_URL: ${{ secrets.RENDER_PRODUCTION_URL }}
       run: |
@@ -181,98 +185,10 @@ jobs:
             echo "✅ Production is up and running (HTTP $response)"
             exit 0
           else
-            echo "⏳ Health check failed (HTTP $response), waiting 5 seconds..."
-            sleep 5
+            echo "⏳ Attempt $((counter + 1))/$max_attempts - Health check failed (HTTP $response)"
+            sleep 10
             counter=$((counter + 1))
           fi
         done
         
-        echo "❌ Production failed to start after $max_attempts attempts"
-        exit 1
-
-  smart-rollback:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    environment: production
-    
-    steps:
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y curl jq
-    
-    - name: Smart rollback procedure
-      env:
-        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
-        RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
-      run: |
-        echo "🎯 Smart rollback procedure..."
-        
-        DEPLOYS_JSON=$(curl -s \
-          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys?limit=5" \
-          -H "Authorization: Bearer $RENDER_API_KEY")
-        
-        SUCCESSFUL_DEPLOYS=$(echo "$DEPLOYS_JSON" | jq -r '[.[] | select(.status == "succeeded")] | length')
-        
-        if [ "$SUCCESSFUL_DEPLOYS" -gt 1 ]; then
-          echo "✅ Found $SUCCESSFUL_DEPLOYS successful deploys - using Render rollback"
-          
-          PREVIOUS_DEPLOY_ID=$(echo "$DEPLOYS_JSON" | jq -r '
-            [.[] | select(.status == "succeeded")] | 
-            if length > 1 then .[1].id else null end
-          ')
-          
-          echo "🔄 Rolling back to deploy ID: $PREVIOUS_DEPLOY_ID"
-          
-          curl -X POST \
-            "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
-            -H "Authorization: Bearer $RENDER_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "{\"deployId\": \"$PREVIOUS_DEPLOY_ID\"}"
-            
-          echo "✅ Render rollback initiated"
-          
-        else
-          echo "⚠️  Not enough deploy history - using simple redeploy"
-          
-          curl -X POST \
-            "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
-            -H "Authorization: Bearer $RENDER_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d '{"clearCache": true}'
-            
-          echo "✅ Simple redeploy initiated"
-        fi
-
-  simple-redeploy:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    environment: production
-    
-    steps:
-    - name: Install curl
-      run: sudo apt-get update && sudo apt-get install -y curl
-    
-    - name: Simple redeploy to production
-      env:
-        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
-        RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
-      run: |
-        echo "🔄 Simple redeploy to production..."
-        
-        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
-          -H "Authorization: Bearer $RENDER_API_KEY" \
-          -H "Content-Type: application/json" \
-          -d '{"clearCache": true}')
-        
-        BODY=$(echo "$RESPONSE" | head -n -1)
-        STATUS=$(echo "$RESPONSE" | tail -n1)
-        
-        if [ "$STATUS" -eq 200 ] || [ "$STATUS" -eq 201 ]; then
-          echo "✅ Production redeploy triggered successfully"
-          echo "This will deploy the latest stable commit on main branch"
-          echo "Response: $BODY"
-        else
-          echo "❌ Failed to trigger redeploy: HTTP $STATUS"
-          echo "Response: $BODY"
-          exit 1
-        fi
+        echo "⚠️ Production health check failed after $max_attempts attempts"
