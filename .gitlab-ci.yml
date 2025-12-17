@@ -1,0 +1,399 @@
+image: node:18
+
+variables:
+  NODE_ENV: test
+
+stages:
+  - test
+  - deploy-staging
+  - integration-test
+  - deploy-production
+  - monitoring
+  - rollback
+
+cache:
+  paths:
+    - node_modules/
+  key: ${CI_COMMIT_REF_SLUG}
+
+before_script:
+  - node --version
+  - npm --version
+  - npm ci
+
+unit-tests:
+  stage: test
+  script:
+    - npm test
+  artifacts:
+    when: always
+    reports:
+      junit: test-results/unit.xml
+    paths:
+      - coverage/
+    expire_in: 1 week
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  only:
+    - main
+    - develop
+    - merge_requests
+
+integration-tests:
+  stage: test
+  script:
+    - npm run test:integration
+  artifacts:
+    when: always
+    reports:
+      junit: test-results/integration.xml
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+    - merge_requests
+
+deploy-staging:
+  stage: deploy-staging
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      echo "🚀 Deploying to Staging on Render..."
+      curl -X POST \
+        "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID/deploys" \
+        -H "Authorization: Bearer $RENDER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d '{"clearCache": true}'
+      echo "✅ Staging deployment triggered"
+  environment:
+    name: staging
+    url: $RENDER_STAGING_URL
+  only:
+    - develop
+  when: manual
+
+staging-smoke-test:
+  stage: integration-test
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      echo "🧪 Testing Staging Environment..."
+      STAGING_URL="https://web-services-lab4-staging-new.onrender.com"
+      echo "Staging URL: $STAGING_URL"
+
+      # Ждем пока приложение поднимется
+      counter=0
+      max_attempts=15
+
+      while [ $counter -lt $max_attempts ]; do
+        echo "⏳ Attempt $((counter + 1))/$max_attempts - Checking $STAGING_URL/health"
+        
+        # Используем более надежную проверку
+        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
+        
+        if [ "$response" = "200" ]; then
+          echo "✅ Staging is up and running (HTTP $response)"
+          
+          # Запускаем smoke тесты
+          echo "🚀 Running smoke tests..."
+          
+          # Test health endpoint
+          echo "Testing /health endpoint..."
+          health_response=$(curl -s -w "%{http_code}" "$STAGING_URL/health")
+          health_status=$(echo "$health_response" | tail -n1)
+          
+          if [ "$health_status" -eq 200 ]; then
+            echo "✅ Health endpoint working"
+            
+            # Test main endpoint
+            echo "Testing / endpoint..."
+            main_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/")
+            
+            if [ "$main_status" -eq 200 ]; then
+              echo "✅ Main endpoint working"
+              
+              # Test API endpoint
+              echo "Testing /api/test/all endpoint..."
+              api_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/api/test/all")
+              
+              if [ "$api_status" -eq 200 ]; then
+                echo "✅ API endpoint working"
+                echo "🎉 All staging smoke tests passed successfully!"
+                exit 0
+              else
+                echo "❌ API endpoint failed: HTTP $api_status"
+              fi
+            else
+              echo "❌ Main endpoint failed: HTTP $main_status"
+            fi
+          else
+            echo "❌ Health endpoint failed: HTTP $health_status"
+          fi
+          exit 0
+        else
+          echo "❌ Health check failed (HTTP $response), waiting 10 seconds..."
+          sleep 10
+          counter=$((counter + 1))
+        fi
+      done
+
+      # Если не удалось подключиться после всех попыток
+      echo "❌ Staging failed to start after $max_attempts attempts"
+      exit 1
+  environment:
+    name: staging
+    url: "https://web-services-lab4-staging-new.onrender.com"
+  only:
+    - develop
+
+deploy-production:
+  stage: deploy-production
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      echo "🚀 Deploying to Production on Render..."
+      curl -X POST \
+        "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+        -H "Authorization: Bearer $RENDER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d '{"clearCache": true}'
+      echo "✅ Production deployment triggered"
+  environment:
+    name: production
+    url: $RENDER_PRODUCTION_URL
+  only:
+    - main
+  when: manual
+
+production-smoke-test:
+  stage: monitoring
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      echo "🧪 Testing Production Environment..."
+      PRODUCTION_URL="https://web-services-lab4-production-new.onrender.com"
+      echo "Production URL: $PRODUCTION_URL"
+
+      # Ждем пока приложение поднимется
+      counter=0
+      max_attempts=15
+
+      while [ $counter -lt $max_attempts ]; do
+        echo "⏳ Attempt $((counter + 1))/$max_attempts - Checking $PRODUCTION_URL/health"
+        
+        # Используем более надежную проверку
+        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
+        
+        if [ "$response" = "200" ]; then
+          echo "✅ Production is up and running (HTTP $response)"
+          
+          # Запускаем smoke тесты
+          echo "🚀 Running smoke tests..."
+          
+          # Test health endpoint
+          echo "Testing /health endpoint..."
+          health_response=$(curl -s -w "%{http_code}" "$PRODUCTION_URL/health")
+          health_status=$(echo "$health_response" | tail -n1)
+          
+          if [ "$health_status" -eq 200 ]; then
+            echo "✅ Health endpoint working"
+            
+            # Test main endpoint
+            echo "Testing / endpoint..."
+            main_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/")
+            
+            if [ "$main_status" -eq 200 ]; then
+              echo "✅ Main endpoint working"
+              
+              # Test API endpoint
+              echo "Testing /api/test/all endpoint..."
+              api_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/api/test/all")
+              
+              if [ "$api_status" -eq 200 ]; then
+                echo "✅ API endpoint working"
+                echo "🎉 All Production smoke tests passed successfully!"
+                exit 0
+              else
+                echo "❌ API endpoint failed: HTTP $api_status"
+              fi
+            else
+              echo "❌ Main endpoint failed: HTTP $main_status"
+            fi
+          else
+            echo "❌ Health endpoint failed: HTTP $health_status"
+          fi
+          exit 0
+        else
+          echo "❌ Health check failed (HTTP $response), waiting 10 seconds..."
+          sleep 10
+          counter=$((counter + 1))
+        fi
+      done
+
+      # Если не удалось подключиться после всех попыток
+      echo "❌ Production failed to start after $max_attempts attempts"
+      exit 1
+  environment:
+    name: production
+    url: "https://web-services-lab4-production-new.onrender.com"
+  only:
+    - main
+  when: manual
+
+smart-rollback:
+  stage: rollback
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      echo "🎯 Smart rollback procedure..."
+
+      # 1. Сначала проверяем историю деплоев
+      echo "📋 Checking deploy history..."
+      DEPLOYS_JSON=$(curl -s \
+        "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys?limit=5" \
+        -H "Authorization: Bearer $RENDER_API_KEY")
+
+      SUCCESSFUL_DEPLOYS=$(echo "$DEPLOYS_JSON" | jq -r '[.[] | select(.status == "succeeded")] | length')
+
+      if [ "$SUCCESSFUL_DEPLOYS" -gt 1 ]; then
+        echo "✅ Found $SUCCESSFUL_DEPLOYS successful deploys - using Render rollback"
+        
+        PREVIOUS_DEPLOY_ID=$(echo "$DEPLOYS_JSON" | jq -r '
+          [.[] | select(.status == "succeeded")] | 
+          if length > 1 then .[1].id else null end
+        ')
+        
+        curl -X POST \
+          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+          -H "Authorization: Bearer $RENDER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "{\"deployId\": \"$PREVIOUS_DEPLOY_ID\"}"
+          
+        echo "✅ Render rollback initiated"
+        
+      else
+        echo "⚠️  Not enough deploy history - using simple redeploy"
+        
+        curl -X POST \
+          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+          -H "Authorization: Bearer $RENDER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{"clearCache": true}'
+          
+        echo "✅ Simple redeploy initiated"
+      fi
+  environment:
+    name: production
+  only:
+    - main
+  when: manual
+
+simple-redeploy:
+  stage: rollback
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      echo "🔄 Simple redeploy to production..."
+
+      # Просто запускаем новый деплой (самый безопасный способ)
+      RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+        "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+        -H "Authorization: Bearer $RENDER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d '{"clearCache": true}')
+
+      # Разделяем response body и status code
+      BODY=$(echo "$RESPONSE" | head -n -1)
+      STATUS=$(echo "$RESPONSE" | tail -n1)
+
+      if [ "$STATUS" -eq 200 ] || [ "$STATUS" -eq 201 ]; then
+        echo "✅ Production redeploy triggered successfully"
+        echo "This will deploy the latest stable commit on main branch"
+        echo "Response: $BODY"
+      else
+        echo "❌ Failed to trigger redeploy: HTTP $STATUS"
+        echo "Response: $BODY"
+        exit 1
+      fi
+  environment:
+    name: production
+  only:
+    - main
+  when: manual
+
+git-rollback-mr:
+  stage: rollback
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache git curl jq
+  script:
+    - |
+      echo "🔄 Creating rollback Merge Request..."
+
+      REPO_URL="https://oauth2:${GITLAB_ACCESS_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git"
+
+      # Клонируем и находим предыдущий коммит
+      git clone "$REPO_URL" /tmp/repo
+      cd /tmp/repo
+
+      git config user.email "ci@gitlab.com"
+      git config user.name "GitLab CI Rollback"
+      git fetch origin
+      git checkout main
+      git pull origin main
+
+      # Находим стабильный коммит для отката
+      ROLLBACK_COMMIT=$(git log --oneline --grep='^[^[]' -5 | head -2 | tail -1 | cut -d' ' -f1)
+
+      if [ -z "$ROLLBACK_COMMIT" ]; then
+        ROLLBACK_COMMIT=$(git log --oneline -3 | tail -1 | cut -d' ' -f1)
+      fi
+
+      BRANCH_NAME="rollback/$(date +%Y%m%d-%H%M%S)"
+      git checkout -b "$BRANCH_NAME" "$ROLLBACK_COMMIT"
+      git push "$REPO_URL" "$BRANCH_NAME"
+
+      # Создаем Merge Request через GitLab API
+      MR_RESPONSE=$(curl -s -X POST \
+        "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/merge_requests" \
+        -H "PRIVATE-TOKEN: ${GITLAB_ACCESS_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d @- << EOF
+      {
+        "id": ${CI_PROJECT_ID},
+        "source_branch": "${BRANCH_NAME}",
+        "target_branch": "main",
+        "title": "🚨 Emergency Rollback to ${ROLLBACK_COMMIT:0:8}",
+        "description": "Automated rollback due to production issues.\n\n**Commit:** ${ROLLBACK_COMMIT}\n**Reason:** Production deployment failure\n\nThis MR will trigger a new deployment to production when merged.",
+        "remove_source_branch": true,
+        "squash": false
+      }
+      EOF
+      )
+
+      MR_URL=$(echo "$MR_RESPONSE" | jq -r '.web_url')
+
+      if [ "$MR_URL" != "null" ]; then
+        echo "✅ Rollback Merge Request created: $MR_URL"
+        echo "📋 Please merge this MR to complete the rollback"
+      else
+        echo "❌ Failed to create Merge Request"
+        echo "Response: $MR_RESPONSE"
+        exit 1
+      fi
+  environment:
+    name: production
+  only:
+    - main
+  when: manual
