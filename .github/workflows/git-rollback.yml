@@ -1,10 +1,10 @@
-name: Git Rollback (для одной ветки main)
+name: Git Rollback
 
 on:
   workflow_dispatch:
     inputs:
       commit_hash:
-        description: 'Хэш коммита для отката (например: abc123def)'
+        description: 'Commit hash to rollback to (e.g., abc123)'
         required: true
         type: string
 
@@ -23,21 +23,20 @@ jobs:
     
     - name: Setup Git
       run: |
-        git config user.name "GitHub Actions Bot"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
     
     - name: Verify commit exists
       id: verify-commit
       run: |
         COMMIT_HASH="${{ github.event.inputs.commit_hash }}"
         
-        # Проверяем, что коммит существует
-        if git cat-file -t "$COMMIT_HASH" 2>/dev/null | grep -q "commit"; then
+        if git show $COMMIT_HASH --quiet 2>/dev/null; then
           echo "✅ Commit $COMMIT_HASH exists"
           echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
         else
-          echo "❌ Commit $COMMIT_HASH not found in repository"
-          echo "Available recent commits:"
+          echo "❌ Commit $COMMIT_HASH not found"
+          echo "Recent commits:"
           git log --oneline -10
           exit 1
         fi
@@ -47,13 +46,11 @@ jobs:
       run: |
         BRANCH_NAME="rollback/$(date +%Y%m%d-%H%M%S)"
         git checkout -b "$BRANCH_NAME" ${{ steps.verify-commit.outputs.commit_hash }}
-        echo "✅ Created branch: $BRANCH_NAME"
         echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
     
     - name: Push rollback branch
       run: |
         git push origin ${{ steps.create-branch.outputs.branch_name }}
-        echo "✅ Pushed branch to remote"
     
     - name: Create Pull Request
       id: create-pr
@@ -64,34 +61,15 @@ jobs:
         base: main
         title: "🚨 Rollback to ${{ github.event.inputs.commit_hash }}"
         body: |
-          ## 🔄 Emergency Rollback
+          Automated rollback to commit `${{ github.event.inputs.commit_hash }}`
           
-          **Target commit:** `${{ github.event.inputs.commit_hash }}`
+          Created by GitHub Actions workflow.
+          **Merge this PR to complete the rollback.**
           
-          **Created by:** GitHub Actions Rollback Workflow
-          **Timestamp:** $(date -u)
-          
-          ### 📋 Changes in this rollback:
-          ```bash
-          git diff ${{ github.event.inputs.commit_hash }}...main --stat
-          ```
-          
-          ### ⚠️ Instructions:
-          1. Review the changes above
-          2. Merge this PR to complete the rollback
-          3. After merge, trigger deployment manually
-          
-          **Auto-delete branch:** Yes
+          After merging, trigger deployment manually.
         delete-branch: true
     
-    - name: Show PR information
+    - name: Show PR info
       run: |
-        echo "✅ Rollback Pull Request created successfully!"
-        echo "🔗 PR URL: ${{ steps.create-pr.outputs.pull-request-url }}"
-        echo ""
-        echo "📋 Next steps:"
-        echo "1. Open the PR link above"
-        echo "2. Review the changes"
-        echo "3. Merge the PR"
-        echo "4. Go to GitHub Actions → CI/CD Pipeline"
-        echo "5. Run 'deploy-production' workflow"
+        echo "✅ Rollback PR created: ${{ steps.create-pr.outputs.pull-request-url }}"
+        echo "Next: Review and merge the PR, then trigger deployment."

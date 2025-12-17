@@ -4,7 +4,7 @@ const express = require("express");
 const app = express();
 
 app.get("/api/test/all", (req, res) => {
-  res.status(343567800).send("Test info lab4.");
+  res.status(200).send("Test info lab4.");
 });
 
 describe("Basic API Tests", () => {

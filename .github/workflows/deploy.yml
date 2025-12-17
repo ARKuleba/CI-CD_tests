@@ -3,10 +3,12 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [main]
-  workflow_dispatch: # для ручного запуска деплоев
+  workflow_dispatch:
 
 env:
   NODE_ENV: test
+  DB_DIALECT: sqlite
+  DB_STORAGE: ./test-database.sqlite
 
 jobs:
   test:
@@ -19,44 +21,63 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Cache node modules
-      uses: actions/cache@v3
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
-        restore-keys: |
-          ${{ runner.os }}-node-
-    
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
     
-    - name: Node and npm versions
+    - name: Debug environment
       run: |
-        node --version
-        npm --version
+        echo "=== ENVIRONMENT VARIABLES ==="
+        echo "NODE_ENV: $NODE_ENV"
+        echo "DB_DIALECT: $DB_DIALECT"
+        echo "DB_STORAGE: $DB_STORAGE"
+        echo "============================="
     
     - name: Install dependencies
-      run: npm ci
+      run: |
+        npm ci
+        echo "✅ Dependencies installed"
+        echo "SQLite version:"
+        npm list sqlite3
+    
+    - name: Create test database directory
+      run: mkdir -p ./test-db
     
     - name: Run unit tests
-      run: npm test
+      run: |
+        echo "🔧 Running unit tests..."
+        npm test
       continue-on-error: false
     
     - name: Run integration tests
-      run: npm run test:integration
+      env:
+        DB_STORAGE: ./test-db/test.sqlite
+        JWT_SECRET: test-jwt-secret-for-ci-12345
+        PORT: 3000
+      run: |
+        echo "🔧 Running integration tests..."
+        echo "Using SQLite database: $DB_STORAGE"
+        
+        # Убедимся, что файл БД существует
+        touch $DB_STORAGE
+        
+        # Запуск тестов с детальным выводом
+        npm run test:integration -- --verbose --detectOpenHandles --forceExit
+        
+        echo "✅ Integration tests completed"
       continue-on-error: false
     
     - name: Upload test results
-      uses: actions/upload-artifact@v4  # ✅ ИСПРАВЛЕНО: v3 → v4
       if: always()
+      uses: actions/upload-artifact@v4
       with:
         name: test-results
         path: |
           test-results/
           coverage/
+          test-db/
         retention-days: 7
 
   deploy-staging:
@@ -95,16 +116,24 @@ jobs:
         echo "🧪 Testing Staging Environment..."
         echo "Staging URL: $STAGING_URL"
         
-        # Простая проверка (упрощённая)
-        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
+        counter=0
+        max_attempts=10
         
-        if [ "$response" = "200" ]; then
-          echo "✅ Staging is up and running (HTTP $response)"
-          exit 0
-        else
-          echo "❌ Staging failed: HTTP $response"
-          exit 1
-        fi
+        while [ $counter -lt $max_attempts ]; do
+          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
+          
+          if [ "$response" = "200" ]; then
+            echo "✅ Staging is up and running (HTTP $response)"
+            exit 0
+          else
+            echo "⏳ Health check failed (HTTP $response), waiting 5 seconds..."
+            sleep 5
+            counter=$((counter + 1))
+          fi
+        done
+        
+        echo "❌ Staging failed to start after $max_attempts attempts"
+        exit 1
 
   deploy-production:
     needs: test
@@ -142,16 +171,24 @@ jobs:
         echo "🧪 Testing Production Environment..."
         echo "Production URL: $PRODUCTION_URL"
         
-        # Простая проверка
-        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
+        counter=0
+        max_attempts=10
         
-        if [ "$response" = "200" ]; then
-          echo "✅ Production is up and running (HTTP $response)"
-          exit 0
-        else
-          echo "❌ Production failed: HTTP $response"
-          exit 1
-        fi
+        while [ $counter -lt $max_attempts ]; do
+          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
+          
+          if [ "$response" = "200" ]; then
+            echo "✅ Production is up and running (HTTP $response)"
+            exit 0
+          else
+            echo "⏳ Health check failed (HTTP $response), waiting 5 seconds..."
+            sleep 5
+            counter=$((counter + 1))
+          fi
+        done
+        
+        echo "❌ Production failed to start after $max_attempts attempts"
+        exit 1
 
   smart-rollback:
     runs-on: ubuntu-latest
@@ -169,8 +206,6 @@ jobs:
       run: |
         echo "🎯 Smart rollback procedure..."
         
-        # 1. Проверяем историю деплоев
-        echo "📋 Checking deploy history..."
         DEPLOYS_JSON=$(curl -s \
           "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys?limit=5" \
           -H "Authorization: Bearer $RENDER_API_KEY")
