@@ -2,8 +2,8 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main]  # ТОЛЬКО main
-  workflow_dispatch: # для ручного запуска деплоев
+    branches: [main]
+  workflow_dispatch:
 
 env:
   NODE_ENV: test
@@ -33,6 +33,11 @@ jobs:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
     
+    - name: Node and npm versions
+      run: |
+        node --version
+        npm --version
+    
     - name: Install dependencies
       run: npm ci
     
@@ -57,10 +62,8 @@ jobs:
   deploy-staging:
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'  # РУЧНОЙ ЗАПУСК
-    environment:
-      name: staging
-      url: ${{ secrets.RENDER_STAGING_URL }}
+    if: github.event_name == 'workflow_dispatch'
+    environment: staging  # ← ИЗМЕНЕНИЕ ЗДЕСЬ
     
     steps:
     - name: Deploy to Staging (Render)
@@ -92,7 +95,6 @@ jobs:
         echo "🧪 Testing Staging Environment..."
         echo "Staging URL: $STAGING_URL"
         
-        # Простая проверка (упрощённая)
         response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
         
         if [ "$response" = "200" ]; then
@@ -107,9 +109,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
-    environment:
-      name: production
-      url: ${{ secrets.RENDER_PRODUCTION_URL }}
+    environment: production  # ← ИЗМЕНЕНИЕ ЗДЕСЬ
     
     steps:
     - name: Deploy to Production (Render)
@@ -141,7 +141,6 @@ jobs:
         echo "🧪 Testing Production Environment..."
         echo "Production URL: $PRODUCTION_URL"
         
-        # Простая проверка
         response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
         
         if [ "$response" = "200" ]; then
@@ -155,8 +154,7 @@ jobs:
   smart-rollback:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
-    environment:
-      name: production
+    environment: production
     
     steps:
     - name: Install dependencies
@@ -169,8 +167,6 @@ jobs:
       run: |
         echo "🎯 Smart rollback procedure..."
         
-        # 1. Проверяем историю деплоев
-        echo "📋 Checking deploy history..."
         DEPLOYS_JSON=$(curl -s \
           "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys?limit=5" \
           -H "Authorization: Bearer $RENDER_API_KEY")
@@ -210,8 +206,7 @@ jobs:
   simple-redeploy:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
-    environment:
-      name: production
+    environment: production
     
     steps:
     - name: Install curl
