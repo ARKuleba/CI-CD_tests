@@ -66,30 +66,91 @@ jobs:
       run: |
         echo "📌 Current commit hash: $(git rev-parse HEAD)"
         echo "📌 Commit message: $(git log -1 --pretty=%B)"
+        echo "📌 Code in server.js:"
+        grep -A2 -B2 'app.get("/"' server.js || echo "Route not found in server.js"
 
-    - name: Deploy to Staging via Render Hook
+    - name: Deploy specific commit to Staging
       env:
-        RENDER_STAGING_DEPLOY_HOOK: ${{ secrets.RENDER_STAGING_DEPLOY_HOOK }}
+        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        RENDER_STAGING_SERVICE_ID: ${{ secrets.RENDER_STAGING_SERVICE_ID }}
+        GITHUB_SHA: ${{ github.sha }}
       run: |
-        echo "🚀 Deploying to Staging via Render Hook..."
-        echo "Hook URL (first 60 chars): ${RENDER_STAGING_DEPLOY_HOOK:0:60}..."
+        echo "🚀 Deploying commit $GITHUB_SHA to Staging..."
         
-        # Отправляем запрос к Render Hook
-        response=$(curl -s -w "%{http_code}" -X POST "$RENDER_STAGING_DEPLOY_HOOK")
-        status_code=${response: -3}
+        # 1. Сначала проверяем текущий деплой
+        echo "📋 Checking current deploy status..."
+        CURRENT_DEPLOY=$(curl -s \
+          "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID" \
+          -H "Authorization: Bearer $RENDER_API_KEY")
         
-        if [ "$status_code" = "200" ] || [ "$status_code" = "201" ]; then
-          echo "✅ Staging deployment triggered successfully (HTTP $status_code)"
-          echo "Render will deploy commit: $(git rev-parse HEAD)"
+        echo "Current service: $CURRENT_DEPLOY"
+        
+        # 2. Запускаем новый деплой
+        echo "🔄 Starting new deployment..."
+        DEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID/deploys" \
+          -H "Authorization: Bearer $RENDER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "clearCache": true
+          }')
+        
+        # Разделяем ответ и статус код
+        DEPLOY_BODY=$(echo "$DEPLOY_RESPONSE" | head -n -1)
+        DEPLOY_STATUS=$(echo "$DEPLOY_RESPONSE" | tail -n1)
+        
+        echo "Deploy response status: $DEPLOY_STATUS"
+        echo "Deploy response body: $DEPLOY_BODY"
+        
+        if [ "$DEPLOY_STATUS" = "200" ] || [ "$DEPLOY_STATUS" = "201" ]; then
+          echo "✅ Staging deployment triggered successfully!"
+          
+          # Извлекаем ID деплоя
+          DEPLOY_ID=$(echo "$DEPLOY_BODY" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "Deploy ID: $DEPLOY_ID"
+          
+          # Проверяем статус деплоя
+          echo "⏳ Checking deploy status..."
+          sleep 10
+          
+          CHECK_COUNTER=0
+          MAX_CHECKS=30
+          
+          while [ $CHECK_COUNTER -lt $MAX_CHECKS ]; do
+            DEPLOY_INFO=$(curl -s \
+              "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID/deploys/$DEPLOY_ID" \
+              -H "Authorization: Bearer $RENDER_API_KEY")
+            
+            STATUS=$(echo "$DEPLOY_INFO" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+            echo "Deploy status: $STATUS (check $((CHECK_COUNTER + 1))/$MAX_CHECKS)"
+            
+            if [ "$STATUS" = "succeeded" ]; then
+              echo "🎉 Deploy succeeded!"
+              break
+            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "canceled" ]; then
+              echo "❌ Deploy failed: $STATUS"
+              echo "Deploy info: $DEPLOY_INFO"
+              exit 1
+            fi
+            
+            sleep 10
+            CHECK_COUNTER=$((CHECK_COUNTER + 1))
+          done
+          
+          if [ $CHECK_COUNTER -eq $MAX_CHECKS ]; then
+            echo "⚠️ Deploy still in progress after $MAX_CHECKS checks"
+          fi
+          
         else
-          echo "❌ Failed to trigger staging deploy: HTTP $status_code"
+          echo "❌ Failed to trigger deploy: HTTP $DEPLOY_STATUS"
+          echo "Response: $DEPLOY_BODY"
           exit 1
         fi
 
-    - name: Wait for staging deployment
+    - name: Wait for application to start
       run: |
-        echo "⏳ Waiting 60 seconds for deployment to start..."
-        sleep 60
+        echo "⏳ Waiting 90 seconds for application to fully start..."
+        sleep 90
 
   integration-tests:
     name: Run Integration Tests
@@ -135,35 +196,48 @@ jobs:
         npm run test:integration -- --verbose --detectOpenHandles
       continue-on-error: false
 
-    - name: Smoke test Staging
-      if: success()
+    - name: Verify Staging Deployment
       env:
         STAGING_URL: ${{ secrets.RENDER_STAGING_URL }}
       run: |
-        echo "🧪 Testing Staging Environment..."
+        echo "🧪 Verifying Staging Deployment..."
         echo "Staging URL: $STAGING_URL"
         
         counter=0
-        max_attempts=15
+        max_attempts=20
         
         while [ $counter -lt $max_attempts ]; do
-          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
+          echo "⏳ Attempt $((counter + 1))/$max_attempts"
           
-          if [ "$response" = "200" ]; then
-            echo "✅ Staging is up and running (HTTP $response)"
+          # Проверяем health endpoint
+          health_response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
+          
+          if [ "$health_response" = "200" ]; then
+            echo "✅ Health check passed (HTTP $health_response)"
             
-            # Дополнительная проверка - получаем реальный ответ
-            content=$(curl -s "$STAGING_URL/")
-            echo "📄 Staging response: $content"
-            exit 0
+            # Проверяем основной endpoint
+            content=$(curl -s --max-time 10 "$STAGING_URL/" || echo "CURL_ERROR")
+            
+            if echo "$content" | grep -q "11111111fghjkl;1"; then
+              echo "🎉 SUCCESS! New code deployed to staging!"
+              echo "Response: $content"
+              exit 0
+            elif echo "$content" | grep -q "111111111"; then
+              echo "❌ OLD CODE DETECTED! Staging still has old message"
+              echo "Response: $content"
+              exit 1
+            else
+              echo "⚠️ Unexpected response: $content"
+              exit 1
+            fi
           else
-            echo "⏳ Attempt $((counter + 1))/$max_attempts - Health check failed (HTTP $response)"
+            echo "❌ Health check failed (HTTP $health_response), waiting 10 seconds..."
             sleep 10
             counter=$((counter + 1))
           fi
         done
         
-        echo "⚠️ Staging failed to start after $max_attempts attempts"
+        echo "⚠️ Staging verification failed after $max_attempts attempts"
         exit 1
 
   deploy-production:
@@ -171,7 +245,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: integration-tests
     environment: production
-    if: success()  # Автоматический запуск при успешных тестах
+    if: success()
 
     steps:
     - name: Checkout code
@@ -182,65 +256,73 @@ jobs:
     - name: Debug production commit
       run: |
         echo "📌 Deploying to production commit: $(git rev-parse HEAD)"
-        echo "📌 Commit message: $(git log -1 --pretty=%B)"
+        echo "📌 Code to deploy:"
+        grep -A2 -B2 'app.get("/"' server.js
 
-    - name: Deploy to Production via Render Hook
+    - name: Deploy to Production
       env:
-        RENDER_PRODUCTION_DEPLOY_HOOK: ${{ secrets.RENDER_PRODUCTION_DEPLOY_HOOK }}
+        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
       run: |
-        echo "🚀 Deploying to Production via Render Hook..."
-        echo "Hook URL (first 60 chars): ${RENDER_PRODUCTION_DEPLOY_HOOK:0:60}..."
+        echo "🚀 Deploying to Production..."
         
-        response=$(curl -s -w "%{http_code}" -X POST "$RENDER_PRODUCTION_DEPLOY_HOOK")
-        status_code=${response: -3}
+        DEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+          -H "Authorization: Bearer $RENDER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{"clearCache": true}')
         
-        if [ "$status_code" = "200" ] || [ "$status_code" = "201" ]; then
-          echo "✅ Production deployment triggered successfully (HTTP $status_code)"
-          echo "Production will deploy commit: $(git rev-parse HEAD)"
+        DEPLOY_BODY=$(echo "$DEPLOY_RESPONSE" | head -n -1)
+        DEPLOY_STATUS=$(echo "$DEPLOY_RESPONSE" | tail -n1)
+        
+        if [ "$DEPLOY_STATUS" = "200" ] || [ "$DEPLOY_STATUS" = "201" ]; then
+          echo "✅ Production deployment triggered!"
+          echo "Response: $DEPLOY_BODY"
         else
-          echo "❌ Failed to trigger production deploy: HTTP $status_code"
+          echo "❌ Failed to trigger production deploy: HTTP $DEPLOY_STATUS"
+          echo "Response: $DEPLOY_BODY"
           exit 1
         fi
 
     - name: Wait for production deployment
       run: |
-        echo "⏳ Waiting 90 seconds for production deployment..."
-        sleep 90
+        echo "⏳ Waiting 120 seconds for production deployment..."
+        sleep 120
 
-    - name: Smoke test Production
-      if: success()
+    - name: Verify Production Deployment
       env:
         PRODUCTION_URL: ${{ secrets.RENDER_PRODUCTION_URL }}
       run: |
-        echo "🧪 Testing Production Environment..."
+        echo "🧪 Verifying Production Deployment..."
         echo "Production URL: $PRODUCTION_URL"
         
         counter=0
-        max_attempts=20
+        max_attempts=25
         
         while [ $counter -lt $max_attempts ]; do
-          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
+          echo "⏳ Attempt $((counter + 1))/$max_attempts"
           
-          if [ "$response" = "200" ]; then
-            echo "✅ Production is up and running (HTTP $response)"
+          health_response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
+          
+          if [ "$health_response" = "200" ]; then
+            echo "✅ Health check passed (HTTP $health_response)"
             
-            # Проверяем, что изменения применились
-            content=$(curl -s "$PRODUCTION_URL/")
-            echo "📄 Production response: $content"
+            content=$(curl -s --max-time 10 "$PRODUCTION_URL/" || echo "CURL_ERROR")
             
-            # Проверяем, что это именно наше новое сообщение
             if echo "$content" | grep -q "11111111fghjkl;1"; then
-              echo "🎉 SUCCESS! New changes deployed to production!"
+              echo "🎉 SUCCESS! New code deployed to production!"
+              echo "Response: $content"
+              exit 0
             else
-              echo "⚠️ Production is running, but content may be old"
+              echo "⚠️ Unexpected production response: $content"
+              exit 1
             fi
-            exit 0
           else
-            echo "⏳ Attempt $((counter + 1))/$max_attempts - Health check failed (HTTP $response)"
+            echo "❌ Health check failed (HTTP $health_response), waiting 15 seconds..."
             sleep 15
             counter=$((counter + 1))
           fi
         done
         
-        echo "⚠️ Production failed to start after $max_attempts attempts"
+        echo "⚠️ Production verification failed after $max_attempts attempts"
         exit 1
