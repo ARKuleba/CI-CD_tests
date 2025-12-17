@@ -1,0 +1,81 @@
+name: Git Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_hash:
+        description: 'Commit hash to rollback to (optional)'
+        required: false
+        type: string
+
+jobs:
+  create-rollback-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Git
+      run: |
+        git config user.name "GitHub Actions Bot"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+    
+    - name: Find rollback commit
+      id: find-commit
+      run: |
+        if [ -n "${{ github.event.inputs.commit_hash }}" ]; then
+          ROLLBACK_COMMIT="${{ github.event.inputs.commit_hash }}"
+          echo "Using provided commit: $ROLLBACK_COMMIT"
+        else
+          echo "Finding previous stable commit..."
+          ROLLBACK_COMMIT=$(git log --oneline --grep='^[^[]' -5 | head -2 | tail -1 | cut -d' ' -f1)
+          
+          if [ -z "$ROLLBACK_COMMIT" ]; then
+            ROLLBACK_COMMIT=$(git log --oneline -3 | tail -1 | cut -d' ' -f1)
+          fi
+          
+          echo "Found commit: $ROLLBACK_COMMIT"
+        fi
+        
+        echo "rollback_commit=$ROLLBACK_COMMIT" >> $GITHUB_OUTPUT
+    
+    - name: Create rollback branch
+      id: create-branch
+      run: |
+        BRANCH_NAME="rollback/$(date +%Y%m%d-%H%M%S)"
+        git checkout -b "$BRANCH_NAME" ${{ steps.find-commit.outputs.rollback_commit }}
+        echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+    
+    - name: Push rollback branch
+      run: |
+        git push origin ${{ steps.create-branch.outputs.branch_name }}
+    
+    - name: Create Pull Request
+      id: create-pr
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        branch: ${{ steps.create-branch.outputs.branch_name }}
+        base: main
+        title: "🚨 Emergency Rollback to ${{ steps.find-commit.outputs.rollback_commit }}"
+        body: |
+          Automated rollback due to production issues.
+          
+          **Commit:** ${{ steps.find-commit.outputs.rollback_commit }}
+          **Reason:** Production deployment failure
+          
+          This PR will trigger a new deployment to production when merged.
+          
+          **Auto-delete branch:** Yes
+        delete-branch: true
+    
+    - name: Output PR URL
+      run: |
+        echo "✅ Rollback Pull Request created: ${{ steps.create-pr.outputs.pull-request-url }}"
+        echo "📋 Please merge this PR to complete the rollback"

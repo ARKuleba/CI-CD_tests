@@ -1,0 +1,345 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch: # для ручного запуска
+
+env:
+  NODE_ENV: test
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Cache node modules
+      uses: actions/cache@v3
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Node and npm versions
+      run: |
+        node --version
+        npm --version
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run unit tests
+      run: npm test
+      continue-on-error: false
+    
+    - name: Run integration tests
+      run: npm run test:integration
+      continue-on-error: false
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results
+        path: |
+          test-results/
+          coverage/
+        retention-days: 7
+
+  deploy-staging:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'workflow_dispatch'
+    environment:
+      name: staging
+      url: ${{ secrets.RENDER_STAGING_URL }}
+    
+    steps:
+    - name: Deploy to Staging (Render)
+      env:
+        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        RENDER_STAGING_SERVICE_ID: ${{ secrets.RENDER_STAGING_SERVICE_ID }}
+      run: |
+        echo "🚀 Deploying to Staging on Render..."
+        curl -X POST \
+          "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID/deploys" \
+          -H "Authorization: Bearer $RENDER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{"clearCache": true}'
+        echo "✅ Staging deployment triggered"
+
+  staging-smoke-test:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Install curl
+      run: sudo apt-get update && sudo apt-get install -y curl
+    
+    - name: Smoke test Staging
+      env:
+        STAGING_URL: ${{ secrets.RENDER_STAGING_URL }}
+      run: |
+        echo "🧪 Testing Staging Environment..."
+        echo "Staging URL: $STAGING_URL"
+        
+        counter=0
+        max_attempts=15
+        
+        while [ $counter -lt $max_attempts ]; do
+          echo "⏳ Attempt $((counter + 1))/$max_attempts - Checking $STAGING_URL/health"
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
+          
+          if [ "$response" = "200" ]; then
+            echo "✅ Staging is up and running (HTTP $response)"
+            
+            echo "🚀 Running smoke tests..."
+            
+            # Test health endpoint
+            echo "Testing /health endpoint..."
+            health_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health")
+            
+            if [ "$health_status" -eq 200 ]; then
+              echo "✅ Health endpoint working"
+              
+              # Test main endpoint
+              echo "Testing / endpoint..."
+              main_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/")
+              
+              if [ "$main_status" -eq 200 ]; then
+                echo "✅ Main endpoint working"
+                
+                # Test API endpoint
+                echo "Testing /api/test/all endpoint..."
+                api_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/api/test/all")
+                
+                if [ "$api_status" -eq 200 ]; then
+                  echo "✅ API endpoint working"
+                  echo "🎉 All staging smoke tests passed successfully!"
+                  exit 0
+                else
+                  echo "❌ API endpoint failed: HTTP $api_status"
+                  exit 1
+                fi
+              else
+                echo "❌ Main endpoint failed: HTTP $main_status"
+                exit 1
+              fi
+            else
+              echo "❌ Health endpoint failed: HTTP $health_status"
+              exit 1
+            fi
+          else
+            echo "❌ Health check failed (HTTP $response), waiting 10 seconds..."
+            sleep 10
+            counter=$((counter + 1))
+          fi
+        done
+        
+        echo "❌ Staging failed to start after $max_attempts attempts"
+        exit 1
+
+  deploy-production:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+      url: ${{ secrets.RENDER_PRODUCTION_URL }}
+    
+    steps:
+    - name: Deploy to Production (Render)
+      env:
+        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
+      run: |
+        echo "🚀 Deploying to Production on Render..."
+        curl -X POST \
+          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+          -H "Authorization: Bearer $RENDER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{"clearCache": true}'
+        echo "✅ Production deployment triggered"
+
+  production-smoke-test:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Install curl
+      run: sudo apt-get update && sudo apt-get install -y curl
+    
+    - name: Smoke test Production
+      env:
+        PRODUCTION_URL: ${{ secrets.RENDER_PRODUCTION_URL }}
+      run: |
+        echo "🧪 Testing Production Environment..."
+        echo "Production URL: $PRODUCTION_URL"
+        
+        counter=0
+        max_attempts=15
+        
+        while [ $counter -lt $max_attempts ]; do
+          echo "⏳ Attempt $((counter + 1))/$max_attempts - Checking $PRODUCTION_URL/health"
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
+          
+          if [ "$response" = "200" ]; then
+            echo "✅ Production is up and running (HTTP $response)"
+            
+            echo "🚀 Running smoke tests..."
+            
+            # Test health endpoint
+            echo "Testing /health endpoint..."
+            health_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/health")
+            
+            if [ "$health_status" -eq 200 ]; then
+              echo "✅ Health endpoint working"
+              
+              # Test main endpoint
+              echo "Testing / endpoint..."
+              main_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/")
+              
+              if [ "$main_status" -eq 200 ]; then
+                echo "✅ Main endpoint working"
+                
+                # Test API endpoint
+                echo "Testing /api/test/all endpoint..."
+                api_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/api/test/all")
+                
+                if [ "$api_status" -eq 200 ]; then
+                  echo "✅ API endpoint working"
+                  echo "🎉 All Production smoke tests passed successfully!"
+                  exit 0
+                else
+                  echo "❌ API endpoint failed: HTTP $api_status"
+                  exit 1
+                fi
+              else
+                echo "❌ Main endpoint failed: HTTP $main_status"
+                exit 1
+              fi
+            else
+              echo "❌ Health endpoint failed: HTTP $health_status"
+              exit 1
+            fi
+          else
+            echo "❌ Health check failed (HTTP $response), waiting 10 seconds..."
+            sleep 10
+            counter=$((counter + 1))
+          fi
+        done
+        
+        echo "❌ Production failed to start after $max_attempts attempts"
+        exit 1
+
+  smart-rollback:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+    
+    steps:
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y curl jq
+    
+    - name: Smart rollback procedure
+      env:
+        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
+      run: |
+        echo "🎯 Smart rollback procedure..."
+        
+        # 1. Сначала проверяем историю деплоев
+        echo "📋 Checking deploy history..."
+        DEPLOYS_JSON=$(curl -s \
+          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys?limit=5" \
+          -H "Authorization: Bearer $RENDER_API_KEY")
+        
+        SUCCESSFUL_DEPLOYS=$(echo "$DEPLOYS_JSON" | jq -r '[.[] | select(.status == "succeeded")] | length')
+        
+        if [ "$SUCCESSFUL_DEPLOYS" -gt 1 ]; then
+          echo "✅ Found $SUCCESSFUL_DEPLOYS successful deploys - using Render rollback"
+          
+          PREVIOUS_DEPLOY_ID=$(echo "$DEPLOYS_JSON" | jq -r '
+            [.[] | select(.status == "succeeded")] | 
+            if length > 1 then .[1].id else null end
+          ')
+          
+          echo "🔄 Rolling back to deploy ID: $PREVIOUS_DEPLOY_ID"
+          
+          curl -X POST \
+            "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"deployId\": \"$PREVIOUS_DEPLOY_ID\"}"
+            
+          echo "✅ Render rollback initiated"
+          
+        else
+          echo "⚠️  Not enough deploy history - using simple redeploy"
+          
+          curl -X POST \
+            "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"clearCache": true}'
+            
+          echo "✅ Simple redeploy initiated"
+        fi
+
+  simple-redeploy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+    
+    steps:
+    - name: Install curl
+      run: sudo apt-get update && sudo apt-get install -y curl
+    
+    - name: Simple redeploy to production
+      env:
+        RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
+      run: |
+        echo "🔄 Simple redeploy to production..."
+        
+        # Просто запускаем новый деплой (самый безопасный способ)
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
+          -H "Authorization: Bearer $RENDER_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{"clearCache": true}')
+        
+        # Разделяем response body и status code
+        BODY=$(echo "$RESPONSE" | head -n -1)
+        STATUS=$(echo "$RESPONSE" | tail -n1)
+        
+        if [ "$STATUS" -eq 200 ] || [ "$STATUS" -eq 201 ]; then
+          echo "✅ Production redeploy triggered successfully"
+          echo "This will deploy the latest stable commit on main branch"
+          echo "Response: $BODY"
+        else
+          echo "❌ Failed to trigger redeploy: HTTP $STATUS"
+          echo "Response: $BODY"
+          exit 1
+        fi
