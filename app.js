@@ -41,7 +41,7 @@ app.get("/health/detailed", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.json({ message: "Test lab 4! 111111111" });
+  res.json({ message: "Test lab 4! 11111111fghjkl;1" });
 });
 
 require("./app/routes/auth.routes")(app);
