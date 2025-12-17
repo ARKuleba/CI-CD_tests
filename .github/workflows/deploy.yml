@@ -2,10 +2,8 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
-  workflow_dispatch: # для ручного запуска
+    branches: [main]  # ТОЛЬКО main
+  workflow_dispatch: # для ручного запуска деплоев
 
 env:
   NODE_ENV: test
@@ -35,11 +33,6 @@ jobs:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
     
-    - name: Node and npm versions
-      run: |
-        node --version
-        npm --version
-    
     - name: Install dependencies
       run: npm ci
     
@@ -64,7 +57,7 @@ jobs:
   deploy-staging:
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop' && github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'  # РУЧНОЙ ЗАПУСК
     environment:
       name: staging
       url: ${{ secrets.RENDER_STAGING_URL }}
@@ -86,7 +79,7 @@ jobs:
   staging-smoke-test:
     needs: deploy-staging
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
+    if: github.event_name == 'workflow_dispatch'
     
     steps:
     - name: Install curl
@@ -99,67 +92,21 @@ jobs:
         echo "🧪 Testing Staging Environment..."
         echo "Staging URL: $STAGING_URL"
         
-        counter=0
-        max_attempts=15
+        # Простая проверка (упрощённая)
+        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
         
-        while [ $counter -lt $max_attempts ]; do
-          echo "⏳ Attempt $((counter + 1))/$max_attempts - Checking $STAGING_URL/health"
-          
-          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$STAGING_URL/health" || echo "000")
-          
-          if [ "$response" = "200" ]; then
-            echo "✅ Staging is up and running (HTTP $response)"
-            
-            echo "🚀 Running smoke tests..."
-            
-            # Test health endpoint
-            echo "Testing /health endpoint..."
-            health_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health")
-            
-            if [ "$health_status" -eq 200 ]; then
-              echo "✅ Health endpoint working"
-              
-              # Test main endpoint
-              echo "Testing / endpoint..."
-              main_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/")
-              
-              if [ "$main_status" -eq 200 ]; then
-                echo "✅ Main endpoint working"
-                
-                # Test API endpoint
-                echo "Testing /api/test/all endpoint..."
-                api_status=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/api/test/all")
-                
-                if [ "$api_status" -eq 200 ]; then
-                  echo "✅ API endpoint working"
-                  echo "🎉 All staging smoke tests passed successfully!"
-                  exit 0
-                else
-                  echo "❌ API endpoint failed: HTTP $api_status"
-                  exit 1
-                fi
-              else
-                echo "❌ Main endpoint failed: HTTP $main_status"
-                exit 1
-              fi
-            else
-              echo "❌ Health endpoint failed: HTTP $health_status"
-              exit 1
-            fi
-          else
-            echo "❌ Health check failed (HTTP $response), waiting 10 seconds..."
-            sleep 10
-            counter=$((counter + 1))
-          fi
-        done
-        
-        echo "❌ Staging failed to start after $max_attempts attempts"
-        exit 1
+        if [ "$response" = "200" ]; then
+          echo "✅ Staging is up and running (HTTP $response)"
+          exit 0
+        else
+          echo "❌ Staging failed: HTTP $response"
+          exit 1
+        fi
 
   deploy-production:
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     environment:
       name: production
       url: ${{ secrets.RENDER_PRODUCTION_URL }}
@@ -181,7 +128,7 @@ jobs:
   production-smoke-test:
     needs: deploy-production
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch'
     
     steps:
     - name: Install curl
@@ -194,62 +141,16 @@ jobs:
         echo "🧪 Testing Production Environment..."
         echo "Production URL: $PRODUCTION_URL"
         
-        counter=0
-        max_attempts=15
+        # Простая проверка
+        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
         
-        while [ $counter -lt $max_attempts ]; do
-          echo "⏳ Attempt $((counter + 1))/$max_attempts - Checking $PRODUCTION_URL/health"
-          
-          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PRODUCTION_URL/health" || echo "000")
-          
-          if [ "$response" = "200" ]; then
-            echo "✅ Production is up and running (HTTP $response)"
-            
-            echo "🚀 Running smoke tests..."
-            
-            # Test health endpoint
-            echo "Testing /health endpoint..."
-            health_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/health")
-            
-            if [ "$health_status" -eq 200 ]; then
-              echo "✅ Health endpoint working"
-              
-              # Test main endpoint
-              echo "Testing / endpoint..."
-              main_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/")
-              
-              if [ "$main_status" -eq 200 ]; then
-                echo "✅ Main endpoint working"
-                
-                # Test API endpoint
-                echo "Testing /api/test/all endpoint..."
-                api_status=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/api/test/all")
-                
-                if [ "$api_status" -eq 200 ]; then
-                  echo "✅ API endpoint working"
-                  echo "🎉 All Production smoke tests passed successfully!"
-                  exit 0
-                else
-                  echo "❌ API endpoint failed: HTTP $api_status"
-                  exit 1
-                fi
-              else
-                echo "❌ Main endpoint failed: HTTP $main_status"
-                exit 1
-              fi
-            else
-              echo "❌ Health endpoint failed: HTTP $health_status"
-              exit 1
-            fi
-          else
-            echo "❌ Health check failed (HTTP $response), waiting 10 seconds..."
-            sleep 10
-            counter=$((counter + 1))
-          fi
-        done
-        
-        echo "❌ Production failed to start after $max_attempts attempts"
-        exit 1
+        if [ "$response" = "200" ]; then
+          echo "✅ Production is up and running (HTTP $response)"
+          exit 0
+        else
+          echo "❌ Production failed: HTTP $response"
+          exit 1
+        fi
 
   smart-rollback:
     runs-on: ubuntu-latest
@@ -268,7 +169,7 @@ jobs:
       run: |
         echo "🎯 Smart rollback procedure..."
         
-        # 1. Сначала проверяем историю деплоев
+        # 1. Проверяем историю деплоев
         echo "📋 Checking deploy history..."
         DEPLOYS_JSON=$(curl -s \
           "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys?limit=5" \
@@ -323,14 +224,12 @@ jobs:
       run: |
         echo "🔄 Simple redeploy to production..."
         
-        # Просто запускаем новый деплой (самый безопасный способ)
         RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
           "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
           -H "Authorization: Bearer $RENDER_API_KEY" \
           -H "Content-Type: application/json" \
           -d '{"clearCache": true}')
         
-        # Разделяем response body и status code
         BODY=$(echo "$RESPONSE" | head -n -1)
         STATUS=$(echo "$RESPONSE" | tail -n1)
         

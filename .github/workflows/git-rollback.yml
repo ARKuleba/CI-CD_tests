@@ -1,11 +1,11 @@
-name: Git Rollback
+name: Git Rollback (для одной ветки main)
 
 on:
   workflow_dispatch:
     inputs:
       commit_hash:
-        description: 'Commit hash to rollback to (optional)'
-        required: false
+        description: 'Хэш коммита для отката (например: abc123def)'
+        required: true
         type: string
 
 jobs:
@@ -26,35 +26,34 @@ jobs:
         git config user.name "GitHub Actions Bot"
         git config user.email "github-actions[bot]@users.noreply.github.com"
     
-    - name: Find rollback commit
-      id: find-commit
+    - name: Verify commit exists
+      id: verify-commit
       run: |
-        if [ -n "${{ github.event.inputs.commit_hash }}" ]; then
-          ROLLBACK_COMMIT="${{ github.event.inputs.commit_hash }}"
-          echo "Using provided commit: $ROLLBACK_COMMIT"
-        else
-          echo "Finding previous stable commit..."
-          ROLLBACK_COMMIT=$(git log --oneline --grep='^[^[]' -5 | head -2 | tail -1 | cut -d' ' -f1)
-          
-          if [ -z "$ROLLBACK_COMMIT" ]; then
-            ROLLBACK_COMMIT=$(git log --oneline -3 | tail -1 | cut -d' ' -f1)
-          fi
-          
-          echo "Found commit: $ROLLBACK_COMMIT"
-        fi
+        COMMIT_HASH="${{ github.event.inputs.commit_hash }}"
         
-        echo "rollback_commit=$ROLLBACK_COMMIT" >> $GITHUB_OUTPUT
+        # Проверяем, что коммит существует
+        if git cat-file -t "$COMMIT_HASH" 2>/dev/null | grep -q "commit"; then
+          echo "✅ Commit $COMMIT_HASH exists"
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Commit $COMMIT_HASH not found in repository"
+          echo "Available recent commits:"
+          git log --oneline -10
+          exit 1
+        fi
     
     - name: Create rollback branch
       id: create-branch
       run: |
         BRANCH_NAME="rollback/$(date +%Y%m%d-%H%M%S)"
-        git checkout -b "$BRANCH_NAME" ${{ steps.find-commit.outputs.rollback_commit }}
+        git checkout -b "$BRANCH_NAME" ${{ steps.verify-commit.outputs.commit_hash }}
+        echo "✅ Created branch: $BRANCH_NAME"
         echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
     
     - name: Push rollback branch
       run: |
         git push origin ${{ steps.create-branch.outputs.branch_name }}
+        echo "✅ Pushed branch to remote"
     
     - name: Create Pull Request
       id: create-pr
@@ -63,19 +62,36 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         branch: ${{ steps.create-branch.outputs.branch_name }}
         base: main
-        title: "🚨 Emergency Rollback to ${{ steps.find-commit.outputs.rollback_commit }}"
+        title: "🚨 Rollback to ${{ github.event.inputs.commit_hash }}"
         body: |
-          Automated rollback due to production issues.
+          ## 🔄 Emergency Rollback
           
-          **Commit:** ${{ steps.find-commit.outputs.rollback_commit }}
-          **Reason:** Production deployment failure
+          **Target commit:** `${{ github.event.inputs.commit_hash }}`
           
-          This PR will trigger a new deployment to production when merged.
+          **Created by:** GitHub Actions Rollback Workflow
+          **Timestamp:** $(date -u)
+          
+          ### 📋 Changes in this rollback:
+          ```bash
+          git diff ${{ github.event.inputs.commit_hash }}...main --stat
+          ```
+          
+          ### ⚠️ Instructions:
+          1. Review the changes above
+          2. Merge this PR to complete the rollback
+          3. After merge, trigger deployment manually
           
           **Auto-delete branch:** Yes
         delete-branch: true
     
-    - name: Output PR URL
+    - name: Show PR information
       run: |
-        echo "✅ Rollback Pull Request created: ${{ steps.create-pr.outputs.pull-request-url }}"
-        echo "📋 Please merge this PR to complete the rollback"
+        echo "✅ Rollback Pull Request created successfully!"
+        echo "🔗 PR URL: ${{ steps.create-pr.outputs.pull-request-url }}"
+        echo ""
+        echo "📋 Next steps:"
+        echo "1. Open the PR link above"
+        echo "2. Review the changes"
+        echo "3. Merge the PR"
+        echo "4. Go to GitHub Actions → CI/CD Pipeline"
+        echo "5. Run 'deploy-production' workflow"
