@@ -52,14 +52,14 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Trigger Staging Deploy
+      id: trigger-deploy
       env:
         RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
         RENDER_STAGING_SERVICE_ID: ${{ secrets.RENDER_STAGING_SERVICE_ID }}
       run: |
         echo "🚀 Triggering staging deployment..."
-        echo "Commit SHA: ${{ github.sha }}"
         
-        # Запускаем деплой и НЕ ждем долго
+        # 1. Запускаем деплой и получаем ID деплоя
         response=$(curl -s -w "\n%{http_code}" \
           -X POST \
           "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID/deploys" \
@@ -72,21 +72,58 @@ jobs:
         
         echo "Status: $status_code"
         
-        # МИНИМАЛЬНОЕ ожидание
         if [ "$status_code" = "201" ] || [ "$status_code" = "200" ]; then
-          echo "✅ Staging deploy started!"
-          sleep 5  # ← Только 5 секунд!
+          # 2. Извлекаем ID деплоя из ответа
+          deploy_id=$(echo "$response_body" | jq -r '.id // empty')
+          if [ -n "$deploy_id" ]; then
+            echo "✅ Staging deploy started! Deploy ID: $deploy_id"
+            echo "deploy_id=$deploy_id" >> $GITHUB_OUTPUT
+            
+            # 3. Ждем завершения деплоя
+            echo "⏳ Waiting for deploy to complete..."
+            timeout=600  # 10 минут максимум
+            interval=10  # проверка каждые 10 секунд
+            elapsed=0
+            
+            while [ $elapsed -lt $timeout ]; do
+              # Проверяем статус деплоя
+              deploy_status=$(curl -s \
+                "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID/deploys/$deploy_id" \
+                -H "Authorization: Bearer $RENDER_API_KEY" | jq -r '.status // "unknown"')
+              
+              echo "Deploy status: $deploy_status ($elapsed/$timeout seconds)"
+              
+              if [ "$deploy_status" = "live" ]; then
+                echo "✅ Deploy completed successfully!"
+                echo "deploy_completed=true" >> $GITHUB_OUTPUT
+                break
+              elif [ "$deploy_status" = "failed" ] || [ "$deploy_status" = "canceled" ]; then
+                echo "❌ Deploy failed with status: $deploy_status"
+                exit 1
+              fi
+              
+              sleep $interval
+              elapsed=$((elapsed + interval))
+            done
+            
+            if [ $elapsed -ge $timeout ]; then
+              echo "❌ Deploy timeout after $timeout seconds"
+              exit 1
+            fi
+          else
+            echo "❌ Could not get deploy ID from response"
+            exit 1
+          fi
         else
-          echo "⚠️ API: $status_code"
-          sleep 3  # ← Всего 3 секунды!
+          echo "❌ Failed to trigger deploy: $status_code"
+          echo "Response: $response_body"
+          exit 1
         fi
-        
-        echo "🎯 Deploy is running. Integration tests can start."
 
   integration-tests:
     name: Run Integration Tests
     runs-on: ubuntu-latest
-    needs: deploy-stage  # Ждем только запуска деплоя, не его завершения
+    needs: [deploy-stage]  # Теперь ждем ЗАВЕРШЕНИЯ деплоя
     environment: staging
     
     env:
@@ -114,34 +151,50 @@ jobs:
         touch $DB_STORAGE
         echo "📁 Database file: $DB_STORAGE"
 
-    - name: Quick Staging Check (неблокирующий)
+    - name: Wait for Staging to be Ready
       run: |
-        echo "🔍 Quick staging check (non-blocking)..."
+        echo "🔍 Waiting for staging to be ready..."
+        timeout=120
+        interval=5
+        elapsed=0
         
-        # Быстрая проверка - 1 попытка
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-          --max-time 5 \
-          "$STAGING_URL/health" 2>/dev/null || echo "NOT_READY")
+        while [ $elapsed -lt $timeout ]; do
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 5 \
+            "$STAGING_URL/health" 2>/dev/null || echo "NOT_READY")
+          
+          echo "Health check: HTTP $http_code ($elapsed/$timeout seconds)"
+          
+          if [ "$http_code" = "200" ]; then
+            echo "✅ Staging is ready!"
+            
+            # Дополнительная проверка API
+            api_status=$(curl -s --max-time 5 "$STAGING_URL/api/health" 2>/dev/null || echo "{}")
+            echo "API status: $api_status"
+            break
+          fi
+          
+          sleep $interval
+          elapsed=$((elapsed + interval))
+        done
         
-        echo "Staging health: HTTP $http_code"
-        
-        if [ "$http_code" = "200" ]; then
-          content=$(curl -s --max-time 5 "$STAGING_URL/" 2>/dev/null || echo "NO_CONTENT")
-          echo "Current content: $content"
+        if [ $elapsed -ge $timeout ]; then
+          echo "❌ Staging not ready after $timeout seconds"
+          exit 1
         fi
 
     - name: Run integration tests
       run: |
-        echo "🧪 Running integration tests (LOCAL tests)..."
-        echo "These tests use SQLite, NOT staging service"
+        echo "🧪 Running integration tests..."
+        echo "Testing against: $STAGING_URL"
         
-        # Запускаем тесты - они должны работать с локальной БД
+        # Запускаем integration тесты против staging окружения
         npm run test:integration -- --verbose --detectOpenHandles
 
   deploy-production:
     name: Auto Deploy to Production
     runs-on: ubuntu-latest
-    needs: integration-tests
+    needs: [integration-tests]  # Ждем успешных integration тестов
     if: success()
     environment: production
 
@@ -149,22 +202,20 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Trigger Production Deploy
+    - name: Trigger and Wait for Production Deploy
       env:
         RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
         RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
       run: |
         echo "🚀 Triggering production deployment..."
-        echo "Commit SHA: ${{ github.sha }}"
         
-        # Быстрый запрос
+        # 1. Запускаем деплой
         response=$(curl -s -w "\n%{http_code}" \
           -X POST \
           "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys" \
           -H "Authorization: Bearer $RENDER_API_KEY" \
           -H "Content-Type: application/json" \
-          -d '{}' \
-          --max-time 10)  # Таймаут 10 секунд
+          -d '{}')
         
         status_code=$(echo "$response" | tail -n1)
         response_body=$(echo "$response" | head -n -1)
@@ -172,28 +223,89 @@ jobs:
         echo "Status: $status_code"
         
         if [ "$status_code" = "201" ] || [ "$status_code" = "200" ]; then
-          echo "✅ Production deploy started!"
-          sleep 3  # ← Только 3 секунды!
+          # 2. Извлекаем ID деплоя
+          deploy_id=$(echo "$response_body" | jq -r '.id // empty')
+          
+          if [ -n "$deploy_id" ]; then
+            echo "✅ Production deploy started! Deploy ID: $deploy_id"
+            
+            # 3. Ждем завершения деплоя
+            echo "⏳ Waiting for production deploy to complete..."
+            timeout=900  # 15 минут для production
+            interval=15
+            elapsed=0
+            
+            while [ $elapsed -lt $timeout ]; do
+              deploy_status=$(curl -s \
+                "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys/$deploy_id" \
+                -H "Authorization: Bearer $RENDER_API_KEY" | jq -r '.status // "unknown"')
+              
+              echo "Deploy status: $deploy_status ($elapsed/$timeout seconds)"
+              
+              if [ "$deploy_status" = "live" ]; then
+                echo "✅ Production deploy completed successfully!"
+                
+                # Проверяем здоровье
+                sleep 10
+                http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+                  --max-time 10 \
+                  "${{ secrets.RENDER_PRODUCTION_URL }}/health" 2>/dev/null || echo "CHECKING")
+                
+                echo "Production health: HTTP $http_code"
+                break
+                
+              elif [ "$deploy_status" = "failed" ] || [ "$deploy_status" = "canceled" ]; then
+                echo "❌ Production deploy failed: $deploy_status"
+                
+                # Получаем детали ошибки
+                deploy_details=$(curl -s \
+                  "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/deploys/$deploy_id" \
+                  -H "Authorization: Bearer $RENDER_API_KEY")
+                echo "Error details: $deploy_details"
+                exit 1
+              fi
+              
+              sleep $interval
+              elapsed=$((elapsed + interval))
+            done
+            
+            if [ $elapsed -ge $timeout ]; then
+              echo "❌ Production deploy timeout"
+              exit 1
+            fi
+          else
+            echo "❌ Could not get deploy ID"
+            exit 1
+          fi
         else
-          echo "❌ Failed: $response_body"
+          echo "❌ Failed to trigger production deploy: $status_code"
           exit 1
         fi
 
-    - name: Quick Production Check
+    - name: Verify Production
       env:
         PRODUCTION_URL: ${{ secrets.RENDER_PRODUCTION_URL }}
       run: |
-        echo "🔍 Quick production check..."
+        echo "🔍 Final production verification..."
         
-        # 1 быстрая проверка
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-          --max-time 8 \
-          "$PRODUCTION_URL/health" 2>/dev/null || echo "DEPLOYING")
+        # Делаем несколько проверок
+        for i in {1..5}; do
+          echo "Attempt $i/5..."
+          
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            "$PRODUCTION_URL/health")
+          
+          if [ "$http_code" = "200" ]; then
+            echo "✅ Production verified successfully!"
+            
+            # Проверяем основную страницу
+            curl -s --max-time 10 "$PRODUCTION_URL/" | head -100
+            exit 0
+          fi
+          
+          sleep 5
+        done
         
-        echo "Production health: HTTP $http_code"
-        
-        if [ "$http_code" = "200" ]; then
-          echo "✅ Production is up!"
-        else
-          echo "⚠️ Production still deploying (normal)"
-        fi
+        echo "❌ Production verification failed"
+        exit 1
