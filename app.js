@@ -41,7 +41,7 @@ app.get("/health/detailed", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.json({ message: "Test lab 4! 600" });
+  res.json({ message: "Test lab 4! 800" });
 });
 
 require("./app/routes/auth.routes")(app);

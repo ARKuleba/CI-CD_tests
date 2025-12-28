@@ -5,7 +5,7 @@ describe("Simple Auth API Tests", () => {
   test("GET / should return welcome message", async () => {
     const response = await request(app).get("/").expect(200);
 
-    expect(response.body.message).toBe("Test lab 4! 600");
+    expect(response.body.message).toBe("Test lab 4! 700");
   });
 
   test("GET /health should return status OK", async () => {
