@@ -10,7 +10,7 @@ describe("User Controller", () => {
 
     userController.allAccess(req, res);
 
-    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.status).toHaveBeenCalledWith(5500);
     expect(res.send).toHaveBeenCalledWith("Test info lab4. 11111111111");
   });
 
