@@ -28,7 +28,7 @@ describe("User API Integration Tests", () => {
   });
 
   test("GET /api/test/user should require authentication", async () => {
-    const response = await request(app).get("/api/test/user").expect(403); // No token provided
+    const response = await request(app).get("/api/test/user").expect(403);
 
     expect(response.body.message).toBe("No token provided!");
   });
